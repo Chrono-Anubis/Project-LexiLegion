@@ -44,3 +44,72 @@ The_Senses (Council of Experts): A multi-agent system for sensory interpretation
 The_Memory_Consolidator: An AI process to fuse sensory data with text to curate and tag memories based on frequency, emotion, and competence.
 
 The_Voice: A unique, non-Google voice provided by a service like ElevenLabs.
+
+# Lexica Command Center
+
+The Lexica Command Center is a prototype for a multi-part, AI-driven companion application. It leverages a Retrieval-Augmented Generation (RAG) architecture to provide answers based on a persistent, curated knowledge base. This project serves as a professional portfolio piece demonstrating a sophisticated understanding of modern AI systems and software architecture.
+
+## Architecture Overview
+
+The system is built on a decoupled, client-server model, with each component having a distinct role.
+
+### 1. The Brain (`rag_engine.py`)
+- **Technology**: Flask, ChromaDB
+- **Function**: A Python-based API server that acts as the core of the system's memory. It exposes an API endpoint for querying the knowledge base. Upon startup, it loads documents, creates vector embeddings, and serves retrieval requests.
+
+### 2. The Tesseract
+- **Technology**: ChromaDB
+- **Function**: The persistent vector database stored locally on disk (`F:/lexica_db`). It houses the "long-term memory" of the system, allowing knowledge to persist between sessions.
+
+### 3. The Orchestrator (`lexica_app.py`)
+- **Technology**: Python, Tkinter, Requests
+- **Function**: A lightweight desktop GUI client. It provides the user interface for interacting with the system. It is responsible for sending user queries to "The Brain" API and displaying the retrieved memories.
+
+### 4. The Soul (Future State)
+- **Technology**: Google Generative AI API
+- **Function**: While the current prototype retrieves memories, the next evolution involves sending those retrieved memories to a powerful Large Language Model (like Gemini) to synthesize a natural, conversational response instead of just listing the retrieved facts.
+
+## Technology Stack
+
+- **Backend**: Python, Flask
+- **Database**: ChromaDB (Vector Store)
+- **Frontend**: Tkinter (Desktop GUI)
+- **Communication**: REST API (via Requests)
+
+## How to Run
+
+1.  **Clone the Repository**
+    ```bash
+    git clone <https://github.com/Chrono-Anubis/Project-LexiLegion.git>
+    cd <Project-LexiLegion>
+    ```
+
+2.  **Set up Virtual Environment**
+    ```bash
+    python -m venv venv
+    # On Windows
+    venv\Scripts\activate
+    ```
+
+3.  **Install Dependencies**
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+4.  **Create Knowledge Base**
+    - Create a folder named `knowledge_base` in the root of the project.
+    - Add at least one `.txt` file with some text inside this folder. The RAG engine will use this as its memory.
+
+5.  **Run the Backend (The Brain)**
+    - Open a new terminal and activate the virtual environment.
+    - Run the Flask server. Make sure your `F:` drive is available or change the path in `rag_engine.py`.
+    ```bash
+    python rag_engine.py
+    ```
+
+6.  **Run the Frontend (The Orchestrator)**
+    - Open a *second* terminal and activate the virtual environment.
+    - Run the Tkinter client application.
+    ```bash
+    python lexica_app.py
+    ```
