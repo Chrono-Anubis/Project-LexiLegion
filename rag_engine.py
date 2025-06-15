@@ -2,6 +2,14 @@ from flask import Flask, request, jsonify
 import chromadb
 import os
 
+# rag_engine.py
+import ollama
+# ... other imports
+
+app = Flask(__name__)
+
+# This list will store the history of the current conversation
+chat_history = []
 # --- Constants ---
 PERSIST_DIRECTORY = "F:/lexica_db"
 COLLECTION_NAME = "lexica_memory"
@@ -15,20 +23,48 @@ class RAG_Engine:
         self.collection = self.client.get_or_create_collection(name=COLLECTION_NAME)
         print("RAG Engine initialized. The Brain is online.")
 
-    def query(self, query_text, n_results=3):
-        """
-        Performs a semantic search on the vector store.
-        """
-        print(f"Querying The Tesseract with: '{query_text}'")
-        try:
-            results = self.collection.query(
-                query_texts=[query_text],
-                n_results=n_results
-            )
-            return results['documents'][0] if results and results['documents'] else []
-        except Exception as e:
-            print(f"Error querying ChromaDB: {e}")
-            return []
+def generate_conversational_response(user_question, context):
+    """
+    Generates a response using the local Ollama model,
+    maintaining conversational history.
+    """
+    # Construct the full prompt with context for this turn
+    prompt_with_context = f"""
+    Using the following context, answer the user's question.
+    If the context does not contain the answer, state that you don't have enough information.
+
+    Context:
+    {context}
+
+    Question:
+    {user_question}
+    """
+    
+    # Append the user's new message to the history
+    # This prepares it for the Ollama API call
+    chat_history.append({'role': 'user', 'content': prompt_with_context})
+
+    print("--- Sending Chat History to Local LLM ---")
+
+    try:
+        # Send the ENTIRE chat history to Ollama
+        response = ollama.chat(
+            model='phi3:mini',
+            messages=chat_history, # Pass the whole history
+            stream=False
+        )
+        
+        # Extract the assistant's response
+        assistant_response = response['message']['content']
+        
+        # Append the assistant's response to the history to remember it for next time
+        chat_history.append({'role': 'assistant', 'content': assistant_response})
+        
+        return assistant_response
+
+    except Exception as e:
+        print(f"Error communicating with Ollama: {e}")
+        return "There was an error communicating with the local AI model."
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
