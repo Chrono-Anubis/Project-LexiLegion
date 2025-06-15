@@ -9,3 +9,6 @@ google-generativeai
 
 # Utility for handling environment variables (for the API key)
 python-dotenv
+
+# For making HTTP requests from the client to the server
+requests
