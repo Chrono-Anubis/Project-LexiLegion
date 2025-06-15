@@ -1,0 +1,11 @@
+# Core Flask server for the RAG API
+flask
+
+# Vector Database and client
+chromadb
+
+# Google API for connecting to the 'Soul' (Lexica/Gemini)
+google-generativeai
+
+# Utility for handling environment variables (for the API key)
+python-dotenv
