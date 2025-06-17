@@ -1,4 +1,4 @@
-# rag_engine.py (v6 with Multi-Query)
+# rag_engine.py (v7 with Reciprocal Rank Fusion)
 
 from flask import Flask, request, jsonify
 import chromadb
@@ -6,6 +6,7 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import os
 import ollama
+from collections import defaultdict
 
 # --- Constants ---
 PERSIST_DIRECTORY = "F:/lexica_db"
@@ -16,20 +17,20 @@ CROSS_ENCODER_MODEL = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
 
 class RAG_Engine:
     """
-    The Brain: Now equipped with a Multi-Query Transformer for superior retrieval.
+    The Brain: Evolved with Reciprocal Rank Fusion for superior context assembly.
     """
     def __init__(self):
+        # ... (init remains the same as v6) ...
         self.client = chromadb.PersistentClient(path=PERSIST_DIRECTORY)
         self.embedding_model = SentenceTransformer(EMBEDDING_MODEL)
         self.cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
         self.collection = self.client.get_or_create_collection(name=COLLECTION_NAME)
         self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         self.initialize_knowledge_base()
-        print("RAG Engine initialized with Multi-Query. The Brain is online.")
+        print("RAG Engine initialized with Rank Fusion. The Brain is online.")
 
     def initialize_knowledge_base(self):
-        """Loads docs, splits them into chunks, and populates the vector store."""
-        # This function remains the same as v5
+        # ... (this function remains the same as v6) ...
         if self.collection.count() > 0:
             return
         print("Knowledge base is empty. Initializing from documents...")
@@ -54,9 +55,7 @@ class RAG_Engine:
             print("Warning: No .txt files found to process in the knowledge_base directory.")
             
     def generate_multiple_queries(self, original_query: str) -> list[str]:
-        """
-        Uses an LLM to generate different versions of the original query.
-        """
+        # ... (this function remains the same as v6) ...
         prompt = f"""
         You are an AI language model assistant. Your task is to generate 3 different versions of the given user question to retrieve relevant documents from a vector database.
         By generating multiple perspectives on the user question, your goal is to help the user overcome some of the limitations of distance-based similarity search.
@@ -64,57 +63,62 @@ class RAG_Engine:
         Original question: {original_query}
         """
         try:
-            response = ollama.chat(
-                model='phi3:mini',
-                messages=[{'role': 'user', 'content': prompt}],
-                stream=False
-            )
+            response = ollama.chat(model='phi3:mini', messages=[{'role': 'user', 'content': prompt}], stream=False)
             generated_queries = response['message']['content'].strip().split('\n')
-            # Add the original query to the list as well
             all_queries = [original_query] + [q for q in generated_queries if q]
             print(f"--- Generated Queries: {all_queries} ---")
             return all_queries
         except Exception as e:
             print(f"Error generating multiple queries: {e}")
-            return [original_query] # Fallback to original query
+            return [original_query]
 
-    def query_and_rerank(self, query_text, retrieve_n=5, final_n=3):
+    def query_and_fuse(self, query_text, retrieve_n=10, final_n=3):
         """
-        Generates multiple queries, retrieves documents for all, and then re-ranks them.
+        Generates multiple queries, retrieves ranked lists, fuses them with RRF,
+        and then re-ranks the top results for final context.
         """
         # 1. Generate multiple queries
         all_queries = self.generate_multiple_queries(query_text)
         
-        # 2. Retrieve documents for each query
-        all_retrieved_docs = []
+        # 2. Retrieve ranked lists for each query
+        all_results = []
         for q in all_queries:
             query_embedding = self.embedding_model.encode([q]).tolist()
-            results = self.collection.query(
-                query_embeddings=query_embedding,
-                n_results=retrieve_n
-            )
+            results = self.collection.query(query_embeddings=query_embedding, n_results=retrieve_n)
             if results.get('documents'):
-                all_retrieved_docs.extend(results['documents'][0])
+                all_results.append(results['documents'][0])
 
-        # Remove duplicate documents
-        unique_docs = list(dict.fromkeys(all_retrieved_docs))
-        
-        if not unique_docs:
+        if not all_results:
             return []
 
-        # 3. Re-rank the unique candidates using the Cross-Encoder against the ORIGINAL query
-        pairs = [[query_text, doc] for doc in unique_docs]
+        # 3. Fuse the ranks using Reciprocal Rank Fusion (RRF)
+        fused_scores = defaultdict(float)
+        k = 60  # Constant for RRF, balances influence of lower-ranked items
+        for rank_list in all_results:
+            for rank, doc in enumerate(rank_list):
+                fused_scores[doc] += 1 / (k + rank)
+        
+        # Sort documents by their fused score
+        reranked_by_fusion = sorted(fused_scores.items(), key=lambda item: item[1], reverse=True)
+        
+        # Get the top documents from the fused list to pass to the cross-encoder
+        fused_docs = [doc for doc, score in reranked_by_fusion]
+        top_fused_docs = fused_docs[:retrieve_n] # Take top N from fused list for final check
+
+        if not top_fused_docs:
+            return []
+
+        # 4. Re-rank the top fused candidates with the powerful Cross-Encoder
+        pairs = [[query_text, doc] for doc in top_fused_docs]
         scores = self.cross_encoder.predict(pairs)
+        final_scored_docs = list(zip(scores, top_fused_docs))
+        final_scored_docs.sort(key=lambda x: x[0], reverse=True)
 
-        # 4. Combine docs with their new scores and sort
-        scored_docs = list(zip(scores, unique_docs))
-        scored_docs.sort(key=lambda x: x[0], reverse=True)
-
-        # 5. Return the top N documents after re-ranking
-        final_docs = [doc for score, doc in scored_docs]
+        # 5. Return the final, most relevant documents
+        final_docs = [doc for score, doc in final_scored_docs]
         return final_docs[:final_n]
 
-# --- The rest of your Flask app code remains the same ---
+# --- Flask routes and generation function remain the same ---
 def generate_response(user_question, context, chat_history):
     prompt_with_context = f"""
     Using ONLY the following context, answer the user's question. If the context does not contain the answer, state that you do not have that information. Do not use any prior knowledge.
@@ -129,11 +133,7 @@ def generate_response(user_question, context, chat_history):
     current_call_history = chat_history + [{'role': 'user', 'content': prompt_with_context}]
     print("--- Sending stateless payload to Local LLM ---")
     try:
-        response = ollama.chat(
-            model='phi3:mini',
-            messages=current_call_history,
-            stream=False
-        )
+        response = ollama.chat(model='phi3:mini', messages=current_call_history, stream=False)
         assistant_response = response['message']['content']
         return assistant_response
     except Exception as e:
@@ -152,7 +152,8 @@ def handle_query():
     query_text = data['query']
     client_chat_history = data.get('chat_history', [])
     
-    retrieved_context = rag_engine_instance.query_and_rerank(query_text)
+    # UPDATED to call the new fusion method
+    retrieved_context = rag_engine_instance.query_and_fuse(query_text)
     
     final_answer = generate_response(query_text, retrieved_context, client_chat_history)
     
