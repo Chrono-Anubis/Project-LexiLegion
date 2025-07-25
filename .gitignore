@@ -192,3 +192,19 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+.vs/
+.v17/
+*.slnx.sqlite
+*.VC.db
+*.opendb
+FileContentIndex/
+CopilotIndices*/
+CodeChunks.db*
+
+# Python/overlay runtime data
+overlay/logs/
+overlay/memory/overlay.db
+overlay/memory/chunks.jsonl
+
+# ChromaDB (if you don’t want to track the persisted index)
+F:/lexica_db/
