@@ -4,69 +4,102 @@ from datetime import datetime
 import operator
 from enum import Enum
 
-# --- 1. The Sub-State Models (The "Thought" Packets) ---
+# --- 1. The Sub-State Models ---
 
 class RouterOutput(BaseModel):
     """The raw output from the Dual-Stream Router."""
-    intent_category: str = Field(description="The user's underlying goal (e.g., 'Coding', 'Factual', 'Creative').")
+    intent_category: str = Field(description="The user's underlying goal.")
     keyword_match: List[str] = Field(description="Specific keywords identified.")
-    ambiguity_score: float = Field(description="0.0 to 1.0 score of how confusing the prompt is.")
+    ambiguity_score: float = Field(description="0.0 to 1.0 score of confusion.")
 
 class ConfidenceMetrics(BaseModel):
     """The calculated scores for the Tri-Band Logic."""
-    consensus_score: float  # Agreement between Intent and Keyword streams
-    probability_score: float # Raw model log-probs
-    intent_score: float     # Safety/Answerability assessment
-    
-    # The Final Weighted Score (0-100)
+    consensus_score: float  
+    probability_score: float 
+    intent_score: float     
     final_confidence: float 
 
 class Volatility(str, Enum):
     """Defines how fast information 'rots'."""
-    STATIC = "static"       # Never expires (Math, History, Core Rules)
-    DYNAMIC = "dynamic"     # Expires slowly (Software versions, APIs)
-    EPHEMERAL = "ephemeral" # Expires instantly (Weather, Stock prices, Current user mood)
+    STATIC = "static"       
+    DYNAMIC = "dynamic"     
+    EPHEMERAL = "ephemeral" 
 
 class RagContext(BaseModel):
     """
     Represents a single retrieved chunk of information.
     Tracks freshness and verification status to prevent stale data injection.
     """
-    content: str = Field(description="The actual text retrieved from the Vector DB.")
-    source_id: str = Field(description="Where this data came from (File ID, URL).")
-    timestamp: datetime = Field(description="When this data was indexed.")
-    similarity_score: float = Field(description="Vector similarity score (0.0 - 1.0).")
+    content: str
+    source_id: str
+    timestamp: Optional[datetime] = None
+    similarity_score: Optional[float] = None
+    volatility: Volatility = Volatility.DYNAMIC
+    is_verified: bool = False
+    is_stale: bool = False
     
-    # The Fix for the "Alzheimer's" Problem
-    volatility: Volatility = Field(
-        default=Volatility.DYNAMIC, 
-        description="How fast does this info rot? STATIC items ignore timestamps."
-    )
-    
-    # The Oracle's Stamp of Approval
-    is_verified: bool = Field(default=False, description="Has the Oracle checked this against live data?")
-    is_stale: bool = Field(default=False, description="Is this data too old to be trusted (based on volatility)?")
+    def check_staleness(self, current_time: datetime, max_age_hours: dict = None) -> bool:
+        """
+        Determines if this context is stale based on volatility rules.
+        """
+        if self.volatility == Volatility.STATIC:
+            return False  # Static data never expires
+        
+        if not self.timestamp:
+            return True  # Missing timestamp = assume stale
+        
+        if not max_age_hours:
+            max_age_hours = {
+                Volatility.EPHEMERAL: 1,    # 1 hour
+                Volatility.DYNAMIC: 168,    # 1 week
+                Volatility.STATIC: float('inf')
+            }
+        
+        age_hours = (current_time - self.timestamp).total_seconds() / 3600
+        threshold = max_age_hours.get(self.volatility, 24)
+        
+        return age_hours > threshold
 
-# --- 2. The Main Graph State (The Memory) ---
+# --- 2. The Main Graph State ---
 
 class LegionState(TypedDict):
     """
-    The Central Nervous System of Legion V13.
-    This dict is passed between every node in the LangGraph.
+    The Central Nervous System of Legion V13.3.
+    
+    CRITICAL ARCHITECTURE NOTE:
+    The 'messages' field uses operator.add, which means nodes must return
+    DELTA updates, not full state copies. 
+    
+    CORRECT:   return {"messages": [new_message_only]}
+    INCORRECT: return {"messages": state["messages"] + [new_message]}
+    
+    The second approach causes exponential duplication because LangGraph
+    performs: existing_list + returned_list
     """
-    # The Conversation History (Standard LangChain memory)
+    # operator.add requires DELTA RETURNS (only new items)
     messages: Annotated[List[str], operator.add]
     
-    # The "Executive Cortex" Data (New V13 Logic)
     router_output: Optional[RouterOutput]
     confidence_metrics: Optional[ConfidenceMetrics]
-    
-    # The RAG Memory (New Quality Control Layer)
     retrieved_context: List[RagContext]
-    
-    # The Decision Flag (Controls the Conditional Edge)
-    # Options: "EXECUTE" (Green), "ASK_USER" (Yellow), "DREAM" (Red)
     routing_decision: str 
-    
-    # The "Dream Seed" (Only used if routing_decision == "DREAM")
     dream_seed: Optional[str]
+    last_error: Optional[str]
+
+def create_initial_state(user_query: str, history: List[str] = None) -> LegionState:
+    """
+    Factory function to create a valid initial state with all required fields.
+    Prevents silent failures from missing keys.
+    """
+    if history is None:
+        history = []
+    
+    return LegionState(
+        messages=history + [user_query],
+        router_output=None,
+        confidence_metrics=None,
+        retrieved_context=[],
+        routing_decision="",
+        dream_seed=None,
+        last_error=None
+    )
