@@ -71,4 +71,4 @@ Open a second terminal and activate the virtual environment.
 Run the Tkinter client application. Note: ngrok is not required for local execution.
 Bash
 
-python lexica_app.py
+main.py
