@@ -1,158 +1,228 @@
-# rag_engine.py (v8 with Contextual Reordering)
-
-from flask import Flask, request, jsonify
+import os
+import time
+import logging
+import re
 import chromadb
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-import os
 import ollama
 from collections import defaultdict
+from dotenv import load_dotenv
 
-# --- Constants ---
-PERSIST_DIRECTORY = "F:/lexica_db"
-KNOWLEDGE_BASE_DIR = "./knowledge_base"
-COLLECTION_NAME = "lexica_memory"
-EMBEDDING_MODEL = 'all-MiniLM-L6-v2'
-CROSS_ENCODER_MODEL = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
+# --- Configuration ---
+load_dotenv()
+logger = logging.getLogger(__name__)
+
+class RagConfig:
+    PERSIST_DIR = os.getenv("RAG_PERSIST_DIR", "F:/lexica_db")
+    KB_DIR = os.getenv("RAG_KB_DIR", "./knowledge_base")
+    COLLECTION_NAME = os.getenv("RAG_COLLECTION", "lexica_memory")
+    EMBED_MODEL = os.getenv("RAG_EMBED_MODEL", "all-MiniLM-L6-v2")
+    RERANK_MODEL = os.getenv("RAG_RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+    LLM_MODEL = os.getenv("RAG_LLM_MODEL", "phi3:mini") 
+    ENABLE_QUERY_EXPANSION = os.getenv("RAG_QUERY_EXPANSION", "true").lower() == "true"
 
 class RAG_Engine:
     """
-    The Brain: Now featuring Contextual Reordering to combat the 'Lost in the Middle' problem.
+    Production RAG Engine for Legion V13.
+    Features Multi-Query, RRF Fusion, Cross-Encoder Re-ranking, and Contextual Reordering.
     """
     def __init__(self):
-        # ... (init remains the same) ...
-        self.client = chromadb.PersistentClient(path=PERSIST_DIRECTORY)
-        self.embedding_model = SentenceTransformer(EMBEDDING_MODEL)
-        self.cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
-        self.collection = self.client.get_or_create_collection(name=COLLECTION_NAME)
-        self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        self.initialize_knowledge_base()
-        print("RAG Engine initialized with Contextual Reordering. The Brain is online.")
+        try:
+            self.client = chromadb.PersistentClient(path=RagConfig.PERSIST_DIR)
+            self.embedding_model = SentenceTransformer(RagConfig.EMBED_MODEL)
+            self.cross_encoder = CrossEncoder(RagConfig.RERANK_MODEL)
+            self.collection = self.client.get_or_create_collection(name=RagConfig.COLLECTION_NAME)
+            self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+            
+            logger.info(f"⚡ RAG Engine Online. KB: {RagConfig.KB_DIR}")
+            
+            if self.collection.count() == 0:
+                self.initialize_knowledge_base()
+                
+        except Exception as e:
+            logger.error(f"RAG Engine initialization failed: {e}")
+            raise
 
     def initialize_knowledge_base(self):
-        # ... (this function remains the same) ...
-        if self.collection.count() > 0: return
-        print("Initializing knowledge base...")
+        logger.info("Initializing knowledge base from disk...")
         all_chunks, all_chunk_ids = [], []
-        if not os.path.exists(KNOWLEDGE_BASE_DIR):
-            print(f"Warning: Knowledge base directory '{KNOWLEDGE_BASE_DIR}' not found.")
+        
+        if not os.path.exists(RagConfig.KB_DIR):
+            logger.warning(f"Knowledge base directory '{RagConfig.KB_DIR}' not found. Creating empty KB.")
+            os.makedirs(RagConfig.KB_DIR, exist_ok=True)
             return
-        for filename in os.listdir(KNOWLEDGE_BASE_DIR):
+            
+        for filename in os.listdir(RagConfig.KB_DIR):
             if filename.endswith(".txt"):
-                filepath = os.path.join(KNOWLEDGE_BASE_DIR, filename)
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    full_text = f.read()
-                    chunks = self.text_splitter.split_text(full_text)
-                    for i, chunk in enumerate(chunks):
-                        all_chunks.append(chunk)
-                        all_chunk_ids.append(f"{filename}_chunk_{i}")
+                filepath = os.path.join(RagConfig.KB_DIR, filename)
+                try:
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        full_text = f.read()
+                        if not full_text.strip(): continue
+                        
+                        chunks = self.text_splitter.split_text(full_text)
+                        for i, chunk in enumerate(chunks):
+                            all_chunks.append(chunk)
+                            all_chunk_ids.append(f"{filename}_chunk_{i}")
+                except Exception as e:
+                    logger.error(f"Error reading {filename}: {e}")
+
         if all_chunks:
-            embeddings = self.embedding_model.encode(all_chunks).tolist()
-            self.collection.add(embeddings=embeddings, documents=all_chunks, ids=all_chunk_ids)
-            print(f"Successfully processed {len(all_chunks)} chunks.")
+            # Batch processing to prevent memory issues
+            batch_size = 100
+            for i in range(0, len(all_chunks), batch_size):
+                batch_chunks = all_chunks[i:i+batch_size]
+                batch_ids = all_chunk_ids[i:i+batch_size]
+                
+                embeddings = self.embedding_model.encode(batch_chunks).tolist()
+                self.collection.add(embeddings=embeddings, documents=batch_chunks, ids=batch_ids)
+                logger.info(f"Indexed batch {i//batch_size + 1}")
+            
+            logger.info(f"Successfully processed {len(all_chunks)} chunks.")
 
-    def generate_multiple_queries(self, original_query: str) -> list[str]:
-        # ... (this function remains the same) ...
-        prompt = f"You are an AI assistant. Generate 3 different versions of the user question to retrieve relevant documents from a vector database. Provide these alternative questions separated by newlines.\nOriginal question: {original_query}"
+    def generate_multiple_queries(self, original_query: str, num_queries=3) -> list[str]:
+        """Generates alternative search queries to improve recall."""
+        prompt = f"Generate {num_queries} alternative search queries for: '{original_query}'. Output only the queries, one per line."
         try:
-            response = ollama.chat(model='phi3:mini', messages=[{'role': 'user', 'content': prompt}], stream=False)
-            generated_queries = response['message']['content'].strip().split('\n')
-            return [original_query] + [q for q in generated_queries if q]
-        except Exception: return [original_query]
+            response = ollama.chat(model=RagConfig.LLM_MODEL, messages=[{'role': 'user', 'content': prompt}], stream=False)
+            raw_queries = response['message']['content'].strip().split('\n')
+            
+            # Robust cleaning: remove numbering (1., - )
+            clean_queries = []
+            for q in raw_queries:
+                cleaned = re.sub(r'^[\d\-\*\•\.)\]]+\s*', '', q.strip())
+                if cleaned and len(cleaned) > 5:
+                    clean_queries.append(cleaned)
+            
+            # Deduplicate
+            return list(dict.fromkeys([original_query] + clean_queries))[:num_queries+1]
+        except Exception as e: 
+            logger.warning(f"Query expansion failed: {e}")
+            return [original_query]
 
-    def reorder_context(self, query_text, context_docs):
+    def reciprocal_rank_fusion(self, all_queries, retrieve_n=10, k=60):
         """
-        Uses an LLM to reorder the retrieved documents for optimal generation.
+        Combines results from multiple queries using RRF algorithm.
         """
-        print("--- Performing Contextual Reordering ---")
-        prompt = f"""
-        Given the following user query and a list of retrieved documents, your task is to reorder the documents.
-        The most relevant documents that directly answer the query should be placed at the beginning and end of the list.
-        Less relevant, contextual documents should be placed in the middle.
-
-        User Query: {query_text}
-
-        Retrieved Documents:
-        {"\n---\n".join(context_docs)}
-
-        Return the reordered list of documents, separated by '---'.
-        """
-        try:
-            response = ollama.chat(model='phi3:mini', messages=[{'role': 'user', 'content': prompt}], stream=False)
-            reordered_text = response['message']['content']
-            # Split the reordered text back into a list of documents
-            reordered_docs = reordered_text.split('---')
-            return [doc.strip() for doc in reordered_docs if doc.strip()]
-        except Exception as e:
-            print(f"Error during context reordering: {e}")
-            return context_docs # Fallback to original order
-
-    def query_and_process(self, query_text, retrieve_n=10, final_n=3):
-        """
-        The full pipeline: Multi-Query -> Fusion -> Re-ranking -> Contextual Reordering
-        """
-        # 1. & 2. Multi-Query and Retrieval
-        all_queries = self.generate_multiple_queries(query_text)
-        all_results = []
+        fused_scores = defaultdict(float)
+        
         for q in all_queries:
             query_embedding = self.embedding_model.encode([q]).tolist()
             results = self.collection.query(query_embeddings=query_embedding, n_results=retrieve_n)
-            if results.get('documents'):
-                all_results.append(results['documents'][0])
-        if not all_results: return []
-
-        # 3. Fuse the ranks using RRF
-        fused_scores = defaultdict(float)
-        for rank_list in all_results:
-            for rank, doc in enumerate(rank_list):
-                fused_scores[doc] += 1 / (60 + rank)
-        reranked_by_fusion = sorted(fused_scores.items(), key=lambda item: item[1], reverse=True)
-        fused_docs = [doc for doc, score in reranked_by_fusion][:retrieve_n]
-        if not fused_docs: return []
-
-        # 4. Re-rank with Cross-Encoder
-        pairs = [[query_text, doc] for doc in fused_docs]
-        scores = self.cross_encoder.predict(pairs)
-        final_scored_docs = sorted(zip(scores, fused_docs), key=lambda x: x[0], reverse=True)
+            
+            if results.get('documents') and results['documents'][0]:
+                docs = results['documents'][0]
+                for rank, doc in enumerate(docs):
+                    fused_scores[doc] += 1.0 / (k + rank + 1) # rank is 0-indexed here
         
-        # 5. Contextual Reordering on the top N results
-        top_docs = [doc for score, doc in final_scored_docs][:final_n]
-        reordered_docs = self.reorder_context(query_text, top_docs)
+        return sorted(fused_scores.keys(), key=lambda x: fused_scores[x], reverse=True)
 
-        return reordered_docs
+    def reorder_context_deterministic(self, context_docs):
+        """
+        Reorders documents to place most relevant info at start/end (Lost in the Middle fix).
+        """
+        if len(context_docs) <= 2: return context_docs
+        
+        reordered = []
+        # Convert to deque or just list handling
+        # Strategy: [1, 3, 5, ..., 6, 4, 2] logic
+        # Simple implementation: Alternate adding to start and end
+        # But for list return: [Best, 3rd, 5th ... 6th, 4th, 2nd]
+        # Actually simpler: [Best, ..., Worst, ..., 2nd Best]
+        # Common approach: [0, 2, 4, ... 5, 3, 1]
+        
+        # Let's use the explicit "Best at ends" logic
+        # Input is sorted by relevance (Best -> Worst)
+        # Output layout: [1, 3, 5, 7, 9, 10, 8, 6, 4, 2]
+        
+        layout = [None] * len(context_docs)
+        left, right = 0, len(context_docs) - 1
+        
+        for i, doc in enumerate(context_docs):
+            if i % 2 == 0:
+                layout[left] = doc
+                left += 1
+            else:
+                layout[right] = doc
+                right -= 1
+        
+        return layout
 
-# --- Flask routes and generation function remain the same ---
+    def query_and_process(self, query_text, retrieve_n=10, final_n=5):
+        """
+        Optimized retrieval pipeline.
+        """
+        start_time = time.time()
+        
+        try:
+            # 1. Query Expansion
+            if RagConfig.ENABLE_QUERY_EXPANSION:
+                all_queries = self.generate_multiple_queries(query_text)
+            else:
+                all_queries = [query_text]
+            
+            # 2. Retrieval & RRF Fusion
+            fused_docs = self.reciprocal_rank_fusion(all_queries, retrieve_n)
+            if not fused_docs: return []
+            
+            # Take top candidates for re-ranking
+            candidates = fused_docs[:retrieve_n] # RRF already sorted them
+
+            # 3. Cross-Encoder Re-ranking
+            pairs = [[query_text, doc] for doc in candidates]
+            scores = self.cross_encoder.predict(pairs)
+            final_scored_docs = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
+            top_docs = [doc for score, doc in final_scored_docs][:final_n]
+            
+            # 4. Contextual Reordering
+            final_docs = self.reorder_context_deterministic(top_docs)
+            
+            elapsed = time.time() - start_time
+            logger.info(f"Retrieval complete: {len(final_docs)} docs in {elapsed:.2f}s")
+            
+            return final_docs
+
+        except Exception as e:
+            logger.error(f"Query processing error: {e}", exc_info=True)
+            return []
+
+# --- Generation Function (Used by main.py) ---
 def generate_response(user_question, context, chat_history):
-    prompt_with_context = f"""
-    Using ONLY the following context, answer the user's question. If the context does not contain the answer, state that you do not have that information. Do not use any prior knowledge.
-
-    Context:
-    {"---".join(context)}
-
-    Question:
-    {user_question}
     """
-    current_call_history = chat_history + [{'role': 'user', 'content': prompt_with_context}]
+    Generates the final answer.
+    """
+    if not context:
+        return "I couldn't find relevant information in my knowledge base."
+
+    # Format context with source citations
+    numbered_context = [f"[Source {i+1}] {ctx}" for i, ctx in enumerate(context)]
+    context_block = "\n\n".join(numbered_context)
+    
+    system_prompt = f"""You are Legion. Answer the user's question using ONLY the context below. 
+    Cite your sources using [Source X] notation.
+    If the context does not contain the answer, say "I don't have that information."
+    
+    Context:
+    {context_block}
+    """
+    
+    messages = [{'role': 'system', 'content': system_prompt}]
+    
+    # Robust History Parsing
+    for msg in chat_history:
+        if isinstance(msg, dict):
+             messages.append(msg)
+        elif isinstance(msg, str):
+             role = 'user' if 'User:' in msg else 'assistant'
+             content = msg.replace('User:', '').replace('Legion:', '').strip()
+             messages.append({'role': role, 'content': content})
+
+    messages.append({'role': 'user', 'content': user_question})
+
     try:
-        response = ollama.chat(model='phi3:mini', messages=current_call_history, stream=False)
+        response = ollama.chat(model=RagConfig.LLM_MODEL, messages=messages, stream=False)
         return response['message']['content']
     except Exception as e:
-        print(f"Error communicating with Ollama: {e}")
+        logger.error(f"Ollama Generation Error: {e}")
         return "Error: Could not communicate with the local AI model."
-
-app = Flask(__name__)
-rag_engine_instance = RAG_Engine()
-
-@app.route('/query', methods=['POST'])
-def handle_query():
-    data = request.get_json()
-    if not data or 'query' not in data: return jsonify({"error": "'query' field is required."}), 400
-    query_text = data['query']
-    client_chat_history = data.get('chat_history', [])
-    retrieved_context = rag_engine_instance.query_and_process(query_text)
-    final_answer = generate_response(query_text, retrieved_context, client_chat_history)
-    updated_chat_history = client_chat_history + [{'role': 'user', 'content': query_text}, {'role': 'assistant', 'content': final_answer}]
-    return jsonify({"results": final_answer, "chat_history": updated_chat_history})
-
-if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=5000, debug=False)
